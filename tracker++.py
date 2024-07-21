@@ -1,6 +1,7 @@
 import asyncio
 import aiohttp
 import struct
+from tqdm.asyncio import tqdm
 import random
 import os
 from urllib.parse import urlparse, urlencode
@@ -120,9 +121,14 @@ class TrackerManager:
             is_working = await checker.check(tracker, info_hash)
             return TrackerResult(tracker, is_working, protocol)
 
-    async def check_trackers(self, trackers: List[str], info_hash: bytes) -> List[TrackerResult]:
+    async def check_trackers(self, trackers: List[str], info_hash: bytes, progress_callback) -> List[TrackerResult]:
         tasks = [self.check_tracker(tracker, info_hash) for tracker in trackers]
-        return await asyncio.gather(*tasks)
+        results = []
+        for i, future in tqdm(enumerate(asyncio.as_completed(tasks)), total=len(tasks)):
+            result = await future
+            results.append(result)
+            progress_callback(int((i + 1) / len(tasks) * 100))
+        return results
 
 async def fetch_tracker_list(session: aiohttp.ClientSession, url: str) -> List[str]:
     async with session.get(url) as response:
@@ -154,10 +160,7 @@ class Worker(QThread):
             self.signals.progress.emit(0)
 
             manager = TrackerManager(session)
-            results = []
-            for i, result in enumerate(await manager.check_trackers(trackers, info_hash)):
-                results.append(result)
-                self.signals.progress.emit(int((i + 1) / len(trackers) * 100))
+            results = await manager.check_trackers(trackers, info_hash, self.update_progress)
 
             working_trackers = [r for r in results if r.is_working]
             udp_success = sum(1 for r in working_trackers if r.protocol == 'udp')
@@ -172,6 +175,9 @@ class Worker(QThread):
             summary += f"可用的 trackers 已保存到 {output_file}"
 
             self.signals.result.emit((summary, working_trackers))
+
+    def update_progress(self, value):
+        self.signals.progress.emit(value)
 
     def run(self):
         asyncio.run(self.run_async())
@@ -267,6 +273,7 @@ class MainWindow(QMainWindow):
 
     def update_progress(self, value):
         self.progress_bar.setValue(value)
+        QApplication.processEvents()  # Force the GUI to update
 
     def show_result(self, result):
         summary, working_trackers = result
