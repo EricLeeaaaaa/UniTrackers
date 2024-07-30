@@ -12,16 +12,27 @@ import string
 from tqdm.asyncio import tqdm
 import time
 import re
+import logging
 
+# Configuration
 MAX_RETRIES = 3
 TIMEOUT = 10
+TCP_CONNECTOR_LIMIT_PER_HOST = 10
+TCP_CONNECTOR_LIMIT = 100
+DEFAULT_THRESHOLD = 1
 
-async def generate_qbittorrent_peer_id():
-    version = "4650"  # qBittorrent 版本 4.6.5
+# Initialize logging
+logging.basicConfig(level=logging.ERROR)  # Set to ERROR to reduce log output
+logger = logging.getLogger(__name__)
+
+async def generate_qbittorrent_peer_id() -> str:
+    """Generate a peer ID for qBittorrent."""
+    version = "4650"  # qBittorrent version 4.6.5
     random_chars = ''.join(random.choices(string.ascii_letters + string.digits, k=12))
     return f"-qB{version}-{random_chars}"
 
-def parse_tracker_url(url):
+def parse_tracker_url(url: str) -> tuple:
+    """Parse tracker URL to extract scheme, hostname, and port."""
     parsed = urlparse(url)
     scheme = parsed.scheme
     hostname = parsed.hostname
@@ -39,7 +50,8 @@ def parse_tracker_url(url):
 
     return scheme, hostname, port
 
-async def udp_scrape(tracker, info_hash):
+async def udp_scrape(tracker: str, info_hash: str) -> tuple:
+    """Scrape a UDP tracker for seeders and leechers."""
     parsed = urlparse(tracker)
     loop = asyncio.get_running_loop()
     try:
@@ -69,10 +81,11 @@ async def udp_scrape(tracker, info_hash):
         finally:
             transport.close()
     except Exception as e:
-        print(f"UDP scrape error for {tracker}: {str(e)}")
+        logger.error(f"UDP scrape error for {tracker}: {str(e)}")
         return 0, 0
 
 async def udp_connect(protocol: 'UDPTrackerProtocol') -> int:
+    """Establish a connection to a UDP tracker."""
     transaction_id = random.randint(0, 0xFFFFFFFF)
     packet = struct.pack('>QII', 0x41727101980, 0, transaction_id)
     response = await protocol.communicate(packet)
@@ -81,7 +94,8 @@ async def udp_connect(protocol: 'UDPTrackerProtocol') -> int:
     action, received_transaction_id, connection_id = struct.unpack('>IIQ', response)
     return connection_id if (action == 0 and received_transaction_id == transaction_id) else None
 
-async def ws_scrape(tracker, info_hash):
+async def ws_scrape(tracker: str, info_hash: str) -> tuple:
+    """Scrape a WebSocket tracker for seeders and leechers."""
     try:
         async with websockets.connect(tracker, timeout=TIMEOUT) as websocket:
             await websocket.send(json.dumps({
@@ -92,21 +106,23 @@ async def ws_scrape(tracker, info_hash):
             data = json.loads(response)
             return data.get('complete', 0), data.get('incomplete', 0)
     except websockets.exceptions.InvalidURI:
-        print(f"Invalid WebSocket URI: {tracker}")
+        logger.error(f"Invalid WebSocket URI: {tracker}")
     except websockets.exceptions.ConnectionClosed:
-        print(f"WebSocket connection closed unexpectedly: {tracker}")
+        logger.error(f"WebSocket connection closed unexpectedly: {tracker}")
     except asyncio.TimeoutError:
-        print(f"WebSocket connection timed out: {tracker}")
+        logger.error(f"WebSocket connection timed out: {tracker}")
     except json.JSONDecodeError:
-        print(f"Invalid JSON response from WebSocket: {tracker}")
+        logger.error(f"Invalid JSON response from WebSocket: {tracker}")
     except Exception as e:
-        print(f"WebSocket scrape error for {tracker}: {str(e)}")
+        logger.error(f"WebSocket scrape error for {tracker}: {str(e)}")
     return 0, 0
 
-def is_html_response(content):
+def is_html_response(content: bytes) -> bool:
+    """Check if the response content is HTML."""
     return re.search(b'<html|<!DOCTYPE', content, re.IGNORECASE) is not None
 
-async def check_tracker(session, tracker, info_hash):
+async def check_tracker(session: aiohttp.ClientSession, tracker: str, info_hash: str) -> tuple:
+    """Check a tracker for seeders and leechers."""
     for _ in range(MAX_RETRIES):
         try:
             scheme, hostname, port = parse_tracker_url(tracker)
@@ -134,7 +150,7 @@ async def check_tracker(session, tracker, info_hash):
                 async with session.get(url, headers=headers, timeout=TIMEOUT) as response:
                     content = await response.read()
                     if is_html_response(content):
-                        print(f"Tracker {tracker} returned HTML instead of bencoded data")
+                        logger.warning(f"Tracker {tracker} returned HTML instead of bencoded data")
                         return tracker, 0, 0
                     try:
                         decoded = bencodepy.decode(content)
@@ -143,27 +159,26 @@ async def check_tracker(session, tracker, info_hash):
                             leechers = decoded.get(b'incomplete', 0)
                             return tracker, seeders, leechers
                     except bencodepy.exceptions.BencodeDecodeError:
-                        print(f"Failed to decode response from {tracker}")
+                        logger.error(f"Failed to decode response from {tracker}")
             elif scheme == 'udp':
                 seeders, leechers = await asyncio.wait_for(udp_scrape(tracker, info_hash), timeout=TIMEOUT)
-                if seeders > 0 or leechers > 0:
-                    print(f"UDP tracker responded: {tracker} - Seeders: {seeders}, Leechers: {leechers}")
                 return tracker, seeders, leechers
             elif scheme in ('ws', 'wss'):
                 seeders, leechers = await asyncio.wait_for(ws_scrape(tracker, info_hash), timeout=TIMEOUT)
                 return tracker, seeders, leechers
         except aiohttp.ClientError as e:
-            print(f"HTTP error for {tracker}: {str(e)}")
+            logger.error(f"HTTP error for {tracker}: {str(e)}")
         except asyncio.TimeoutError:
-            print(f"Timeout for {tracker}, retrying...")
+            logger.warning(f"Timeout for {tracker}, retrying...")
         except Exception as e:
-            print(f"Error for {tracker}: {str(e)}")
+            logger.error(f"Error for {tracker}: {str(e)}")
         
         await asyncio.sleep(1)
     
     return tracker, 0, 0
 
 class UDPTrackerProtocol(asyncio.DatagramProtocol):
+    """Custom UDP protocol for communicating with UDP trackers."""
     def __init__(self, loop: asyncio.AbstractEventLoop):
         self.loop = loop
         self.transport = None
@@ -185,6 +200,7 @@ class UDPTrackerProtocol(asyncio.DatagramProtocol):
             self.future.set_exception(exc or ConnectionError("Connection closed"))
 
     async def communicate(self, data: bytes, timeout: float = 5) -> bytes:
+        """Send data and wait for a response."""
         self.future = self.loop.create_future()
         self.transport.sendto(data)
         try:
@@ -192,7 +208,8 @@ class UDPTrackerProtocol(asyncio.DatagramProtocol):
         except asyncio.TimeoutError:
             return None
 
-async def check_torrent_health(info_hash, tracker_file):
+async def check_torrent_health(info_hash: str, tracker_file: str, threshold: int):
+    """Check the health of a torrent by querying trackers."""
     with open(tracker_file, 'r') as f:
         trackers = [line.strip() for line in f if line.strip()]
 
@@ -200,12 +217,12 @@ async def check_torrent_health(info_hash, tracker_file):
     total_leechers = 0
     active_trackers = []
 
-    conn = aiohttp.TCPConnector(limit_per_host=10, limit=100)
+    conn = aiohttp.TCPConnector(limit_per_host=TCP_CONNECTOR_LIMIT_PER_HOST, limit=TCP_CONNECTOR_LIMIT)
     async with aiohttp.ClientSession(connector=conn) as session:
         tasks = [check_tracker(session, tracker, info_hash) for tracker in trackers]
         for task in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc="Checking trackers"):
             tracker, seeders, leechers = await task
-            if seeders > 0 or leechers > 0:
+            if seeders + leechers >= threshold:
                 active_trackers.append(f"{tracker} | {seeders + leechers} | {seeders}")
                 total_seeders += seeders
                 total_leechers += leechers
@@ -219,18 +236,19 @@ async def check_torrent_health(info_hash, tracker_file):
         print(tracker)
 
 if __name__ == "__main__":
-    if len(sys.argv) != 3:
-        print("使用方法: python script.py <info_hash> <tracker_file>")
+    if len(sys.argv) < 3 or len(sys.argv) > 4:
+        print("使用方法: python script.py <info_hash> <tracker_file> [threshold]")
         sys.exit(1)
 
     info_hash = sys.argv[1]
     tracker_file = sys.argv[2]
+    threshold = int(sys.argv[3]) if len(sys.argv) == 4 else DEFAULT_THRESHOLD
     
     if sys.platform.startswith('win'):
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     
     start_time = time.time()
-    asyncio.run(check_torrent_health(info_hash, tracker_file))
+    asyncio.run(check_torrent_health(info_hash, tracker_file, threshold))
     end_time = time.time()
     
     print(f"\n总运行时间: {end_time - start_time:.2f} 秒")
