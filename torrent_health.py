@@ -223,7 +223,7 @@ async def check_torrent_health(info_hash: str, tracker_file: str, threshold: int
         for task in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc="Checking trackers"):
             tracker, seeders, leechers = await task
             if seeders + leechers >= threshold:
-                active_trackers.append(f"{tracker} | {seeders + leechers} | {seeders}")
+                active_trackers.append((tracker, seeders, leechers))
                 total_seeders += seeders
                 total_leechers += leechers
 
@@ -231,8 +231,13 @@ async def check_torrent_health(info_hash: str, tracker_file: str, threshold: int
     print(f"总下载数: {total_leechers}")
     print(f"总用户数: {total_seeders + total_leechers}")
     print(f"有活跃用户的Tracker数: {len(active_trackers)}")
-    print("\n有活跃用户的Trackers:")
-    for tracker in sorted(active_trackers, key=lambda x: int(x.split('|')[2].strip()), reverse=True):
+
+    print("\n有活跃用户的Trackers（详细信息）:")
+    for tracker, seeders, leechers in sorted(active_trackers, key=lambda x: x[1], reverse=True):
+        print(f"{tracker} | 总用户数: {seeders + leechers} | 做种数: {seeders}")
+
+    print("\n有活跃用户的Trackers（仅URL）:")
+    for tracker, _, _ in sorted(active_trackers, key=lambda x: x[1], reverse=True):
         print(tracker)
 
 if __name__ == "__main__":
