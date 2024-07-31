@@ -69,7 +69,8 @@ async def udp_scrape(tracker: str, info_hash: str) -> tuple:
             transaction_id = random.randint(0, 0xFFFFFFFF)
             packet = struct.pack('>QII', connection_id, 2, transaction_id) + bytes.fromhex(info_hash)
             response = await protocol.communicate(packet)
-            if response is None:
+            if response is None or len(response) < 20:
+                logger.error(f"Invalid UDP response length for {tracker}")
                 return 0, 0
 
             action, received_transaction_id = struct.unpack('>II', response[:8])
@@ -89,7 +90,8 @@ async def udp_connect(protocol: 'UDPTrackerProtocol') -> int:
     transaction_id = random.randint(0, 0xFFFFFFFF)
     packet = struct.pack('>QII', 0x41727101980, 0, transaction_id)
     response = await protocol.communicate(packet)
-    if response is None:
+    if response is None or len(response) < 16:
+        logger.error(f"Invalid UDP connect response length")
         return None
     action, received_transaction_id, connection_id = struct.unpack('>IIQ', response)
     return connection_id if (action == 0 and received_transaction_id == transaction_id) else None
@@ -113,6 +115,8 @@ async def ws_scrape(tracker: str, info_hash: str) -> tuple:
         logger.error(f"WebSocket connection timed out: {tracker}")
     except json.JSONDecodeError:
         logger.error(f"Invalid JSON response from WebSocket: {tracker}")
+    except websockets.exceptions.InvalidHandshake as e:
+        logger.error(f"WebSocket handshake error for {tracker}: {str(e)}")
     except Exception as e:
         logger.error(f"WebSocket scrape error for {tracker}: {str(e)}")
     return 0, 0
@@ -172,7 +176,7 @@ async def check_tracker(session: aiohttp.ClientSession, tracker: str, info_hash:
             logger.warning(f"Timeout for {tracker}, retrying...")
         except Exception as e:
             logger.error(f"Error for {tracker}: {str(e)}")
-        
+
         await asyncio.sleep(1)
     
     return tracker, 0, 0
