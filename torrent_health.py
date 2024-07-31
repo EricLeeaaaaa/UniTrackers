@@ -1,4 +1,3 @@
-# 导入所需的库
 import aiohttp
 import asyncio
 import bencodepy
@@ -13,6 +12,8 @@ from tqdm.asyncio import tqdm
 import time
 import re
 import logging
+from yarl import URL
+from bs4 import BeautifulSoup
 
 # 配置参数
 MAX_RETRIES = 3  # 最大重试次数
@@ -35,21 +36,8 @@ def parse_tracker_url(url: str) -> tuple:
     """解析tracker URL,提取scheme、hostname和port"""
     parsed = urlparse(url)
     scheme = parsed.scheme
-    hostname = parsed.hostname
-    port = parsed.port
-    
-    # 如果端口未指定,根据scheme设置默认端口
-    if port is None:
-        if scheme == 'http':
-            port = 80
-        elif scheme == 'https':
-            port = 443
-        elif scheme == 'udp':
-            port = 6969
-        elif scheme in ('ws', 'wss'):
-            port = 80 if scheme == 'ws' else 443
-
-    return scheme, hostname, port
+    port = parsed.port or (80 if scheme in ('http', 'ws') else 443 if scheme in ('https', 'wss') else 6969)
+    return scheme, parsed.hostname, port
 
 async def udp_scrape(tracker: str, info_hash: str) -> tuple:
     """从UDP tracker获取做种数和下载数"""
@@ -78,7 +66,7 @@ async def udp_scrape(tracker: str, info_hash: str) -> tuple:
             if action != 2 or received_transaction_id != transaction_id:
                 return 0, 0
 
-            seeders, completed, leechers = struct.unpack('>III', response[8:20])
+            seeders, _, leechers = struct.unpack('>III', response[8:20])
             return seeders, leechers
         finally:
             transport.close()
@@ -92,34 +80,138 @@ async def udp_connect(protocol: 'UDPTrackerProtocol') -> int:
     packet = struct.pack('>QII', 0x41727101980, 0, transaction_id)
     response = await protocol.communicate(packet)
     if response is None or len(response) < 16:
-        logger.error(f"Invalid UDP connect response length")
+        logger.error("Invalid UDP connect response length")
         return None
     action, received_transaction_id, connection_id = struct.unpack('>IIQ', response)
     return connection_id if (action == 0 and received_transaction_id == transaction_id) else None
 
 async def ws_scrape(tracker: str, info_hash: str) -> tuple:
     """从WebSocket tracker获取做种数和下载数"""
+    # 构造announce URL
+    parsed_url = urlparse(tracker)
+    ws_url = f"{tracker}/announce" if parsed_url.path != '/announce' else tracker
+
+    # 准备请求数据
+    request_data = {
+        'action': 'announce',
+        'info_hash': info_hash,
+        'peer_id': await generate_qbittorrent_peer_id(),
+        'port': 6881,
+        'uploaded': 0,
+        'downloaded': 0,
+        'left': 1000000,
+        'event': 'started'
+    }
+
+    # 首先尝试使用websockets库
     try:
-        async with websockets.connect(tracker, timeout=TIMEOUT) as websocket:
-            await websocket.send(json.dumps({
-                'action': 'scrape',
-                'info_hash': info_hash
-            }))
+        async with websockets.connect(ws_url, timeout=TIMEOUT) as websocket:
+            await websocket.send(json.dumps(request_data))
             response = await asyncio.wait_for(websocket.recv(), timeout=TIMEOUT)
             data = json.loads(response)
-            return data.get('complete', 0), data.get('incomplete', 0)
-    except websockets.exceptions.InvalidURI:
-        logger.error(f"Invalid WebSocket URI: {tracker}")
-    except websockets.exceptions.ConnectionClosed:
-        logger.error(f"WebSocket connection closed unexpectedly: {tracker}")
-    except asyncio.TimeoutError:
-        logger.error(f"WebSocket connection timed out: {tracker}")
-    except json.JSONDecodeError:
-        logger.error(f"Invalid JSON response from WebSocket: {tracker}")
-    except websockets.exceptions.InvalidHandshake as e:
-        logger.error(f"WebSocket handshake error for {tracker}: {str(e)}")
+            complete = data.get('complete', data.get('seeders', 0))
+            incomplete = data.get('incomplete', data.get('leechers', 0))
+            return complete, incomplete
     except Exception as e:
-        logger.error(f"WebSocket scrape error for {tracker}: {str(e)}")
+        logger.warning(f"WebSocket connection failed, trying HTTP fallback: {str(e)}")
+
+    # 如果websockets失败，尝试使用aiohttp
+    return await http_fallback(ws_url, request_data)
+
+async def http_fallback(ws_url: str, request_data: dict) -> tuple:
+    """WebSocket失败时的HTTP回退"""
+    http_url = URL(ws_url.replace('wss://', 'https://').replace('ws://', 'http://'))
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(http_url, params=request_data, timeout=TIMEOUT) as response:
+                if response.status == 200:
+                    content_type = response.headers.get('Content-Type', '').lower()
+                    if 'application/json' in content_type:
+                        data = await response.json()
+                        complete = data.get('complete', data.get('seeders', 0))
+                        incomplete = data.get('incomplete', data.get('leechers', 0))
+                        return complete, incomplete
+                    elif 'text/html' in content_type:
+                        return parse_html_response(await response.text())
+                    elif 'application/octet-stream' in content_type:
+                        return parse_binary_response(await response.read())
+                    else:
+                        return parse_unknown_response(await response.read(), content_type)
+                logger.error(f"HTTP request failed with status {response.status} for {ws_url}")
+    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        logger.error(f"HTTP request error for {ws_url}: {str(e)}")
+    except Exception as e:
+        logger.error(f"Error during HTTP fallback for {ws_url}: {str(e)}")
+    return 0, 0
+
+def parse_html_response(html_content: str) -> tuple:
+    """尝试从HTML响应中提取做种数和下载数"""
+    try:
+        soup = BeautifulSoup(html_content, 'html.parser')
+        
+        # 方法1：查找包含"Seeders:"和"Leechers:"的文本
+        seeders = soup.find(string=re.compile(r'Seeders:'))
+        leechers = soup.find(string=re.compile(r'Leechers:'))
+        
+        if seeders and leechers:
+            seeders_count = int(re.search(r'\d+', seeders).group())
+            leechers_count = int(re.search(r'\d+', leechers).group())
+            return seeders_count, leechers_count
+        
+        # 方法2：查找可能包含做种数和下载数的元素
+        seeders_elem = soup.find(['span', 'div', 'p'], class_=re.compile(r'seeder|seed', re.I))
+        leechers_elem = soup.find(['span', 'div', 'p'], class_=re.compile(r'leecher|leech', re.I))
+        
+        if seeders_elem and leechers_elem:
+            seeders_count = int(re.search(r'\d+', seeders_elem.text).group())
+            leechers_count = int(re.search(r'\d+', leechers_elem.text).group())
+            return seeders_count, leechers_count
+
+    except Exception as e:
+        logger.error(f"Failed to parse HTML response: {str(e)}")
+    
+    return 0, 0
+
+def parse_binary_response(binary_content: bytes) -> tuple:
+    """尝试从二进制响应中提取做种数和下载数"""
+    try:
+        # 尝试解码为bencode格式
+        decoded = bencodepy.decode(binary_content)
+        if isinstance(decoded, dict):
+            complete = decoded.get(b'complete', 0)
+            incomplete = decoded.get(b'incomplete', 0)
+            return complete, incomplete
+    except bencodepy.exceptions.BencodeDecodeError:
+        # 如果不是bencode格式，可以尝试其他二进制格式的解析
+        pass
+    except Exception as e:
+        logger.error(f"Failed to parse binary response: {str(e)}")
+    
+    return 0, 0
+
+def parse_unknown_response(content: bytes, content_type: str) -> tuple:
+    """尝试解析未知类型的响应"""
+    try:
+        # 尝试解析为文本
+        text_content = content.decode('utf-8', errors='ignore')
+        
+        # 尝试解析为JSON
+        try:
+            data = json.loads(text_content)
+            complete = data.get('complete', data.get('seeders', 0))
+            incomplete = data.get('incomplete', data.get('leechers', 0))
+            return complete, incomplete
+        except json.JSONDecodeError:
+            pass
+        
+        # 尝试从文本中提取数字
+        numbers = re.findall(r'\d+', text_content)
+        if len(numbers) >= 2:
+            return int(numbers[0]), int(numbers[1])
+        
+    except Exception as e:
+        logger.error(f"Failed to parse unknown response type ({content_type}): {str(e)}")
+    
     return 0, 0
 
 def is_html_response(content: bytes) -> bool:
