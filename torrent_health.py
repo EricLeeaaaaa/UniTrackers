@@ -4,7 +4,6 @@ import bencodepy
 import random
 import sys
 from urllib.parse import urlparse, urlencode
-import socket
 import struct
 import websockets
 import json
