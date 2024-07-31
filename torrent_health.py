@@ -1,3 +1,4 @@
+# 导入所需的库
 import aiohttp
 import asyncio
 import bencodepy
@@ -13,30 +14,31 @@ import time
 import re
 import logging
 
-# Configuration
-MAX_RETRIES = 3
-TIMEOUT = 10
-TCP_CONNECTOR_LIMIT_PER_HOST = 10
-TCP_CONNECTOR_LIMIT = 100
-DEFAULT_THRESHOLD = 1
+# 配置参数
+MAX_RETRIES = 3  # 最大重试次数
+TIMEOUT = 10  # 超时时间(秒)
+TCP_CONNECTOR_LIMIT_PER_HOST = 10  # 每个主机的TCP连接限制
+TCP_CONNECTOR_LIMIT = 100  # 总TCP连接限制
+DEFAULT_THRESHOLD = 1  # 默认活跃用户阈值
 
-# Initialize logging
-logging.basicConfig(level=logging.ERROR)  # Set to ERROR to reduce log output
+# 初始化日志
+logging.basicConfig(level=logging.ERROR)  # 设置日志级别为ERROR以减少输出
 logger = logging.getLogger(__name__)
 
 async def generate_qbittorrent_peer_id() -> str:
-    """Generate a peer ID for qBittorrent."""
-    version = "4650"  # qBittorrent version 4.6.5
+    """生成qBittorrent的peer ID"""
+    version = "4650"  # qBittorrent版本4.6.5
     random_chars = ''.join(random.choices(string.ascii_letters + string.digits, k=12))
     return f"-qB{version}-{random_chars}"
 
 def parse_tracker_url(url: str) -> tuple:
-    """Parse tracker URL to extract scheme, hostname, and port."""
+    """解析tracker URL,提取scheme、hostname和port"""
     parsed = urlparse(url)
     scheme = parsed.scheme
     hostname = parsed.hostname
     port = parsed.port
     
+    # 如果端口未指定,根据scheme设置默认端口
     if port is None:
         if scheme == 'http':
             port = 80
@@ -50,7 +52,7 @@ def parse_tracker_url(url: str) -> tuple:
     return scheme, hostname, port
 
 async def udp_scrape(tracker: str, info_hash: str) -> tuple:
-    """Scrape a UDP tracker for seeders and leechers."""
+    """从UDP tracker获取做种数和下载数"""
     parsed = urlparse(tracker)
     loop = asyncio.get_running_loop()
     try:
@@ -59,12 +61,12 @@ async def udp_scrape(tracker: str, info_hash: str) -> tuple:
             remote_addr=(parsed.hostname, parsed.port or 6969)
         )
         try:
-            # Connect
+            # 建立连接
             connection_id = await udp_connect(protocol)
             if connection_id is None:
                 return 0, 0
 
-            # Scrape
+            # 发送scrape请求
             transaction_id = random.randint(0, 0xFFFFFFFF)
             packet = struct.pack('>QII', connection_id, 2, transaction_id) + bytes.fromhex(info_hash)
             response = await protocol.communicate(packet)
@@ -85,7 +87,7 @@ async def udp_scrape(tracker: str, info_hash: str) -> tuple:
         return 0, 0
 
 async def udp_connect(protocol: 'UDPTrackerProtocol') -> int:
-    """Establish a connection to a UDP tracker."""
+    """与UDP tracker建立连接"""
     transaction_id = random.randint(0, 0xFFFFFFFF)
     packet = struct.pack('>QII', 0x41727101980, 0, transaction_id)
     response = await protocol.communicate(packet)
@@ -96,7 +98,7 @@ async def udp_connect(protocol: 'UDPTrackerProtocol') -> int:
     return connection_id if (action == 0 and received_transaction_id == transaction_id) else None
 
 async def ws_scrape(tracker: str, info_hash: str) -> tuple:
-    """Scrape a WebSocket tracker for seeders and leechers."""
+    """从WebSocket tracker获取做种数和下载数"""
     try:
         async with websockets.connect(tracker, timeout=TIMEOUT) as websocket:
             await websocket.send(json.dumps({
@@ -121,16 +123,17 @@ async def ws_scrape(tracker: str, info_hash: str) -> tuple:
     return 0, 0
 
 def is_html_response(content: bytes) -> bool:
-    """Check if the response content is HTML."""
+    """检查响应内容是否为HTML"""
     return re.search(b'<html|<!DOCTYPE', content, re.IGNORECASE) is not None
 
 async def check_tracker(session: aiohttp.ClientSession, tracker: str, info_hash: str) -> tuple:
-    """Check a tracker for seeders and leechers."""
+    """检查tracker的做种数和下载数"""
     for _ in range(MAX_RETRIES):
         try:
             scheme, hostname, port = parse_tracker_url(tracker)
 
             if scheme in ('http', 'https'):
+                # 构造HTTP/HTTPS请求参数
                 params = {
                     'info_hash': bytes.fromhex(info_hash),
                     'peer_id': await generate_qbittorrent_peer_id(),
@@ -181,7 +184,7 @@ async def check_tracker(session: aiohttp.ClientSession, tracker: str, info_hash:
     return tracker, 0, 0
 
 class UDPTrackerProtocol(asyncio.DatagramProtocol):
-    """Custom UDP protocol for communicating with UDP trackers."""
+    """用于与UDP tracker通信的自定义UDP协议"""
     def __init__(self, loop: asyncio.AbstractEventLoop):
         self.loop = loop
         self.transport = None
@@ -203,7 +206,7 @@ class UDPTrackerProtocol(asyncio.DatagramProtocol):
             self.future.set_exception(exc or ConnectionError("Connection closed"))
 
     async def communicate(self, data: bytes, timeout: float = 5) -> bytes:
-        """Send data and wait for a response."""
+        """发送数据并等待响应"""
         self.future = self.loop.create_future()
         self.transport.sendto(data)
         try:
@@ -212,7 +215,8 @@ class UDPTrackerProtocol(asyncio.DatagramProtocol):
             return None
 
 async def check_torrent_health(info_hash: str, tracker_file: str, threshold: int):
-    """Check the health of a torrent by querying trackers."""
+    """检查种子的健康状况,查询所有tracker"""
+    # 读取tracker列表
     with open(tracker_file, 'r') as f:
         trackers = [line.strip() for line in f if line.strip()]
 
@@ -220,8 +224,10 @@ async def check_torrent_health(info_hash: str, tracker_file: str, threshold: int
     total_leechers = 0
     active_trackers = []
 
+    # 创建TCP连接池
     conn = aiohttp.TCPConnector(limit_per_host=TCP_CONNECTOR_LIMIT_PER_HOST, limit=TCP_CONNECTOR_LIMIT)
     async with aiohttp.ClientSession(connector=conn) as session:
+        # 创建并执行所有tracker检查任务
         tasks = [check_tracker(session, tracker, info_hash) for tracker in trackers]
         for task in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc="Checking trackers"):
             tracker, seeders, leechers = await task
@@ -230,6 +236,7 @@ async def check_torrent_health(info_hash: str, tracker_file: str, threshold: int
                 total_seeders += seeders
                 total_leechers += leechers
 
+    # 输出结果
     print(f"总做种数: {total_seeders}")
     print(f"总下载数: {total_leechers}")
     print(f"总用户数: {total_seeders + total_leechers}")
@@ -244,6 +251,7 @@ async def check_torrent_health(info_hash: str, tracker_file: str, threshold: int
         print(tracker)
 
 if __name__ == "__main__":
+    # 检查命令行参数
     if len(sys.argv) < 3 or len(sys.argv) > 4:
         print("使用方法: python script.py <info_hash> <tracker_file> [threshold]")
         sys.exit(1)
@@ -252,9 +260,11 @@ if __name__ == "__main__":
     tracker_file = sys.argv[2]
     threshold = int(sys.argv[3]) if len(sys.argv) == 4 else DEFAULT_THRESHOLD
     
+    # 为Windows设置事件循环策略
     if sys.platform.startswith('win'):
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     
+    # 运行主函数并计时
     start_time = time.time()
     asyncio.run(check_torrent_health(info_hash, tracker_file, threshold))
     end_time = time.time()
